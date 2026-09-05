@@ -219,6 +219,15 @@ macro_rules! check_arg_count {
 pub type InsnResult = Result<InsnFunctionStepResult, Box<LimboError>>;
 pub type InsnFunction = fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> InsnResult;
 
+/// The error for a branch target the program builder left unresolved. Cold
+/// and out of line: with the message formatted at the site, every opcode
+/// that tests its target set the format arguments up on its hot path.
+#[cold]
+#[inline(never)]
+fn unresolved_branch_target(target_pc: crate::vdbe::BranchOffset) -> Box<LimboError> {
+    LimboError::Corrupt(format!("Unresolved label: {target_pc:?}")).into()
+}
+
 /// This is an optimization over `checked_add(n).ok_or(LimboError::Overflow)`. With `ok_or`, the
 /// compiler generates [LimboError] drop glue even though [LimboError::Overflow] owns nothing.
 /// But with [OkOverflow], it's able to skip the drop glue.
@@ -438,7 +447,7 @@ pub fn op_init(
 ) -> InsnResult {
     load_insn!(Init { target_pc }, insn);
     if unlikely(!target_pc.is_offset()) {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
@@ -961,7 +970,7 @@ pub fn op_if_pos(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     let reg = *reg;
     let target_pc = *target_pc;
@@ -992,7 +1001,7 @@ pub fn op_not_null(
 ) -> InsnResult {
     load_insn!(NotNull { reg, target_pc }, insn);
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     let reg = *reg;
     let target_pc = *target_pc;
@@ -1184,7 +1193,7 @@ pub fn op_if(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     if state.registers[*reg]
         .get_value()
@@ -1212,7 +1221,7 @@ pub fn op_if_not(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     if state.registers[*reg]
         .get_value()
@@ -2483,7 +2492,7 @@ pub fn op_column_has_field(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let (_, cursor_type) = program
@@ -5593,7 +5602,7 @@ pub fn op_goto(
 ) -> InsnResult {
     load_insn!(Goto { target_pc }, insn);
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
@@ -5613,7 +5622,7 @@ pub fn op_gosub(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     state.registers[*return_reg].set_int((state.pc + 1) as i64);
     state.pc = target_pc.as_offset_int();
@@ -6197,7 +6206,7 @@ pub fn op_seek_rowid(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let (pc, did_seek) = {
@@ -6816,7 +6825,7 @@ pub fn op_idx_ge(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
@@ -6886,7 +6895,7 @@ pub fn op_idx_le(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
@@ -6933,7 +6942,7 @@ pub fn op_idx_gt(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
@@ -6980,7 +6989,7 @@ pub fn op_idx_lt(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
@@ -7019,7 +7028,7 @@ pub fn op_decr_jump_zero(
 ) -> InsnResult {
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     match &mut state.registers[*reg] {
         Register::Value(Value::Numeric(Numeric::Integer(n))) => {

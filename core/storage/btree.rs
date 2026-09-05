@@ -6750,21 +6750,14 @@ impl CursorTrait for BTreeCursor {
                 }
             }
         }
-        let cached = self
-            .reusable_immutable_record
-            .as_ref()
-            .is_some_and(|record| !record.is_invalidated());
-        if cached {
-            return Ok(IOResult::Done(
-                self.reusable_immutable_record
-                    .as_ref()
-                    .map(ImmutableRecord::get_payload),
-            ));
-        }
+        // A leaf cell without overflow pages, the usual case: decode it on
+        // the pinned page and note where it is for the next column read on
+        // this row. Both fit in 32 bits: the payload lies inside a page of
+        // at most 64 KiB. When a record read filled the reusable record for
+        // this row it holds the same bytes, and testing for that costs more
+        // per row than the parse it saves on the rows where it is filled.
         let contents = self.stack.top_ref().get_contents();
         let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
         if let Some((payload, start)) =
             contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
         {

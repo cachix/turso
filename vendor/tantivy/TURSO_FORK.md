@@ -392,11 +392,12 @@ The Turso dictionary fixture also merges 1,025 terms through Completions.
 The standalone Tantivy dictionary suite has 22 passing tests, including the
 paged reader; the term-offset overflow regression also passes. Command:
 `cargo test --manifest-path vendor/tantivy/Cargo.toml --lib termdict --target-dir /tmp/turso-tantivy-target`.
-On Rust 1.88 the ignored standalone development lockfile selected
-`ordered-float` 5.1.0 (5.5.0 requires Rust 1.90); the Turso lockfile and
-production dependencies were not changed for this test setup.
+The tracked standalone development lockfile pins `ordered-float` 5.1.0 for
+Rust 1.88 (5.5.0 requires Rust 1.90). Vendor CI uses this lock with `--locked`;
+it is separate from the root Turso production lockfile.
 
-`cargo clippy -p turso_core --features fts --lib -- --deny=warnings` failed
-on an unfulfilled `clippy::new_without_default` expectation in the unchanged
-`core/json/cache.rs:107`. The lint was not suppressed and that file was not
-modified. The complete workspace suite and memory benchmarks were not run.
+An earlier local `cargo clippy -p turso_core --features fts --lib -- --deny=warnings`
+run failed on an unfulfilled `clippy::new_without_default` expectation in
+`core/json/cache.rs:107`; this is historical evidence, not the current stack's
+Clippy status. The later PR #8847 `clippy` and `lint` Actions jobs passed.
+The complete workspace suite and memory benchmarks were not run locally.

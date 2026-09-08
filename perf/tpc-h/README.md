@@ -27,15 +27,21 @@ It produces a timestamped results file, e.g. `perf/tpc-h/results_20260216_143000
 
 ## Step 2: Plot the results
 
-Convert the results file to CSV and generate the plot:
+Convert the results file to CSV and generate the figures:
 
 ```bash
 cd perf/tpc-h/plot
 ./results2csv.sh ../results_20260216_143000.txt > results.csv
-uv run plot.py
+uv run plot-tpch.py results.csv
 ```
 
-This produces `tpch.pdf` — a grouped bar chart (log scale) with a data table showing per-query runtimes for Turso vs SQLite.
+This draws a grouped bar chart of per-query runtime for Limbo and SQLite on
+a log scale, in the same style as the `perf/latency` and `perf/throughput`
+plots. It always writes `tpch.png`, `tpch.pdf` and `tpch.tikz`; the `.tikz`
+is a pgfplots picture to `\input` into a LaTeX document that loads pgfplots
+with `\pgfplotsset{compat=1.18}`. A query an engine did not run is marked
+`n/a` in the table under the bars.
+Use `--name limbo=Turso` to change an engine's legend name.
 
 By default, `results2csv.sh` uses the "WITHOUT ANALYZE" results. To use the "WITH ANALYZE" results instead:
 

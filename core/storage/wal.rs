@@ -616,6 +616,10 @@ trait WalCoordination: Debug + Send + Sync {
         Ok(())
     }
 
+    fn yield_read_retries(&self) -> bool {
+        false
+    }
+
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
 
@@ -2406,6 +2410,10 @@ impl WalCoordination for ShmWalCoordination {
         self.authority.reserve_frames(last_frame)
     }
 
+    fn yield_read_retries(&self) -> bool {
+        true
+    }
+
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         self.fallback.cache_frame(page_id, frame_id);
         self.authority.record_frame(page_id, frame_id);
@@ -3390,12 +3398,24 @@ impl WalFile {
 
 impl Wal for WalFile {
     fn begin_read_tx(&self) -> Result<bool> {
-        for _ in 0..5 {
+        let yield_retries = self.coordination.yield_read_retries();
+        let attempts = if yield_retries { 5 } else { 101 };
+        for attempt in 1..=attempts {
             match self.try_begin_read_tx() {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
                 TryBeginReadResult::Err(err) => return Err(err),
                 TryBeginReadResult::Busy => return Err(LimboError::Busy),
-                TryBeginReadResult::Retry => continue,
+                TryBeginReadResult::Retry => {
+                    if !yield_retries && attempt < attempts && attempt > 5 {
+                        if attempt < 10 {
+                            self.io.yield_now();
+                        } else {
+                            self.io.sleep(std::time::Duration::from_micros(
+                                (attempt - 9) * (attempt - 9) * 39,
+                            ));
+                        }
+                    }
+                }
             }
         }
         Err(LimboError::Busy)

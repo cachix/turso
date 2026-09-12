@@ -48,6 +48,45 @@ fn multiprocess_test_io() -> Arc<dyn IO> {
     }
 }
 
+#[test]
+fn investigation_query_deadline_interrupts_writer_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = multiprocess_test_io();
+    let db =
+        open_multiprocess_db(io.clone(), dir.path().join("deadline.db").to_str().unwrap()).unwrap();
+    let writer = db.connect().unwrap();
+    let contender = db.connect().unwrap();
+    writer.execute("CREATE TABLE test(id INTEGER)").unwrap();
+    writer.execute("BEGIN IMMEDIATE").unwrap();
+    contender.set_busy_timeout(Duration::from_secs(1));
+    contender.set_query_timeout(Duration::from_millis(10));
+    let mut stmt = contender.prepare("BEGIN IMMEDIATE").unwrap();
+    let start = std::time::Instant::now();
+    let mut sleeps = 0;
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(2));
+        match stmt.step().unwrap() {
+            StepResult::Sleep { duration } => {
+                sleeps += 1;
+                std::thread::sleep(duration);
+            }
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => continue,
+            StepResult::Interrupt => break,
+            other => panic!("expected contention followed by deadline interruption: {other:?}"),
+        }
+    }
+    assert!(sleeps > 0);
+    println!(
+        "Query deadline interrupted writer contention after {:?}; {sleeps} yielded sleeps",
+        start.elapsed()
+    );
+    drop(stmt);
+    writer.execute("ROLLBACK").unwrap();
+    contender.set_query_timeout(Duration::ZERO);
+    contender.execute("INSERT INTO test VALUES(1)").unwrap();
+}
+
 fn count_test_rows(conn: &Arc<Connection>) -> i64 {
     let mut stmt = conn.prepare("select count(*) from test").unwrap();
     let mut count = 0;
@@ -57,6 +96,112 @@ fn count_test_rows(conn: &Arc<Connection>) -> i64 {
     })
     .unwrap();
     count
+}
+
+#[test]
+fn old_shared_index_capacity_rebuilds_from_wal_on_exclusive_open() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgrade.db");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("CREATE TABLE test(id INTEGER)").unwrap();
+        conn.execute("INSERT INTO test VALUES(42)").unwrap();
+    }
+    DATABASE_MANAGER.lock().clear();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.with_extension("db-tshm"))
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let mut version = [0; 4];
+    file.read_exact(&mut version).unwrap();
+    assert_eq!(u32::from_le_bytes(version), 1);
+    // Version 1 has the same layout. Model the old persisted limits, leaving
+    // the version unchanged: max blocks at byte 28, capacity at byte 36.
+    file.seek(SeekFrom::Start(28)).unwrap();
+    file.write_all(&64u32.to_le_bytes()).unwrap();
+    file.seek(SeekFrom::Start(36)).unwrap();
+    file.write_all(&(64u32 * 4096).to_le_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();
+    assert!(db
+        .shared_wal
+        .read()
+        .metadata
+        .loaded_from_disk_scan
+        .load(Ordering::Acquire));
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM test")[0][0]
+            .as_int()
+            .unwrap(),
+        42
+    );
+    conn.execute("INSERT INTO test VALUES(43)").unwrap();
+    assert_eq!(count_test_rows(&conn), 2);
+}
+
+#[test]
+#[ignore = "requires TURSO_RECOVERY_DB pointing to a disposable clone of the Mac failure"]
+fn recover_saved_mac_overflow_and_reuse_index() {
+    let path = std::env::var("TURSO_RECOVERY_DB").unwrap();
+    let io = multiprocess_test_io();
+    let db = open_multiprocess_db(io.clone(), &path).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_actions_disable();
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM objects")[0][0]
+            .as_int()
+            .unwrap(),
+        7579
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM named_roots")[0][0]
+            .as_int()
+            .unwrap(),
+        813
+    );
+    assert!(!db
+        .shared_wal_coordination()
+        .unwrap()
+        .unwrap()
+        .frame_index_overflowed());
+    conn.execute("CREATE TABLE turso_recovery_probe(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO turso_recovery_probe VALUES(42)")
+        .unwrap();
+    drop(conn);
+    drop(db);
+    for _ in 0..3 {
+        DATABASE_MANAGER.lock().clear();
+        let db = open_multiprocess_db(io.clone(), &path).unwrap();
+        assert!(!db
+            .shared_wal
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        let conn = db.connect().unwrap();
+        conn.wal_auto_actions_disable();
+        assert_eq!(
+            get_rows(&conn, "SELECT id FROM turso_recovery_probe")[0][0]
+                .as_int()
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*) FROM objects")[0][0]
+                .as_int()
+                .unwrap(),
+            7579
+        );
+    }
 }
 
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
@@ -2799,4 +2944,91 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     );
 
     observer_conn.close().unwrap();
+}
+
+// Investigation probe with real SQL and physical WAL frames. No second process.
+#[test]
+#[ignore = "writes about 150 MB to cross the actual shared-index capacity"]
+fn sql_reopened_writer_grows_shared_index_with_old_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sql-overflow.db");
+    let io = multiprocess_test_io();
+    {
+        let db = open_multiprocess_db(io.clone(), path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("PRAGMA page_size = 512").unwrap();
+        conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value BLOB)")
+            .unwrap();
+        conn.execute("INSERT INTO test VALUES (1, X'616263')")
+            .unwrap();
+        assert_eq!(
+            get_rows(&conn, "PRAGMA page_size")[0][0].as_int().unwrap(),
+            512
+        );
+    }
+    DATABASE_MANAGER.lock().clear();
+    let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();
+    assert!(!db
+        .shared_wal
+        .read()
+        .metadata
+        .loaded_from_disk_scan
+        .load(Ordering::Acquire));
+    assert!(db.shared_wal.read().runtime.frame_cache.lock().is_empty());
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(count_test_rows(&reader), 1);
+    conn.execute("INSERT INTO test VALUES (2, zeroblob(140000000))")
+        .unwrap();
+    assert!(authority.snapshot().max_frame > 262144);
+    assert!(!authority.frame_index_overflowed());
+    assert_eq!(count_test_rows(&reader), 1);
+    assert_eq!(
+        get_rows(&conn, "SELECT length(value) FROM test WHERE id=2")[0][0]
+            .as_int()
+            .unwrap(),
+        140000000
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+    reader.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO test VALUES (3, X'646566')")
+        .unwrap();
+    assert_eq!(count_test_rows(&conn), 3);
+}
+
+#[test]
+#[ignore = "writes about 150 MB as the no-reopen control"]
+fn sql_fresh_writer_grows_shared_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sql-fresh-overflow.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA page_size=512").unwrap();
+    conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value BLOB)")
+        .unwrap();
+    conn.execute("INSERT INTO test VALUES (1, X'616263')")
+        .unwrap();
+    conn.execute("INSERT INTO test VALUES (2, zeroblob(140000000))")
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT length(value) FROM test WHERE id=2")[0][0]
+            .as_int()
+            .unwrap(),
+        140000000
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT hex(value) FROM test WHERE id=1")[0][0].to_string(),
+        "616263"
+    );
+    println!("CONTROL PASSED: fresh writer crosses capacity and reads both old and new SQL values");
 }

@@ -99,8 +99,8 @@ fn count_test_rows(conn: &Arc<Connection>) -> i64 {
 }
 
 #[test]
-fn old_shared_index_format_rebuilds_from_wal_on_exclusive_open() {
-    use std::io::{Seek, SeekFrom, Write};
+fn old_shared_index_capacity_rebuilds_from_wal_on_exclusive_open() {
+    use std::io::{Read, Seek, SeekFrom, Write};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("upgrade.db");
     let io = multiprocess_test_io();
@@ -113,11 +113,20 @@ fn old_shared_index_format_rebuilds_from_wal_on_exclusive_open() {
     }
     DATABASE_MANAGER.lock().clear();
     let mut file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(path.with_extension("db-tshm"))
         .unwrap();
     file.seek(SeekFrom::Start(8)).unwrap();
-    file.write_all(&1u32.to_le_bytes()).unwrap();
+    let mut version = [0; 4];
+    file.read_exact(&mut version).unwrap();
+    assert_eq!(u32::from_le_bytes(version), 1);
+    // Version 1 has the same layout. Model the old persisted limits, leaving
+    // the version unchanged: max blocks at byte 28, capacity at byte 36.
+    file.seek(SeekFrom::Start(28)).unwrap();
+    file.write_all(&64u32.to_le_bytes()).unwrap();
+    file.seek(SeekFrom::Start(36)).unwrap();
+    file.write_all(&(64u32 * 4096).to_le_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
     let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();

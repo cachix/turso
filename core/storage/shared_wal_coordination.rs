@@ -38,7 +38,7 @@ use std::ptr::NonNull;
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 /// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
-const SHARED_WAL_COORDINATION_VERSION: u32 = 2;
+const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.

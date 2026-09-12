@@ -522,6 +522,20 @@ trait WalCoordination: Debug + Send + Sync {
     /// Enumerate the latest visible frame per page in the requested frame range.
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
 
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        Ok(self.find_frame(page_id, min_frame, max_frame, frame_watermark))
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        Ok(self.iter_latest_frames(min_frame, max_frame))
+    }
+
     /// Read the current checkpoint epoch used to tag cached WAL pages.
     fn checkpoint_epoch(&self) -> u32;
 
@@ -597,6 +611,10 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Record a newly appended frame in the backend's page-to-frame lookup state.
     fn cache_frame(&self, page_id: u64, frame_id: u64);
+
+    fn reserve_frames(&self, _last_frame: u64) -> Result<()> {
+        Ok(())
+    }
 
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
@@ -1432,15 +1450,6 @@ impl ShmWalCoordination {
             .covers(snapshot, max_frame)
     }
 
-    fn clear_overflow_fallback_coverage(&self) {
-        self.shared
-            .read()
-            .runtime
-            .overflow_fallback_coverage
-            .lock()
-            .clear();
-    }
-
     fn local_authority_snapshot_from_shared(
         shared: &WalFileShared,
         authority_snapshot: SharedWalCoordinationHeader,
@@ -2010,6 +2019,29 @@ impl WalCoordination for ShmWalCoordination {
         self.authority.iter_latest_frames(min_frame, max_frame)
     }
 
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        if self.authority.frame_index_overflowed() {
+            return self
+                .fallback
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark);
+        }
+        self.authority
+            .try_find_frame(page_id, min_frame, max_frame, frame_watermark)
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        if self.authority.frame_index_overflowed() {
+            return self.fallback.try_iter_latest_frames(min_frame, max_frame);
+        }
+        self.authority.try_iter_latest_frames(min_frame, max_frame)
+    }
+
     fn checkpoint_epoch(&self) -> u32 {
         self.authority.checkpoint_epoch()
     }
@@ -2370,15 +2402,36 @@ impl WalCoordination for ShmWalCoordination {
         self.fallback.mark_initialized();
     }
 
+    fn reserve_frames(&self, last_frame: u64) -> Result<()> {
+        self.authority.reserve_frames(last_frame)
+    }
+
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         self.fallback.cache_frame(page_id, frame_id);
         self.authority.record_frame(page_id, frame_id);
+        let snapshot = self.authority.snapshot();
+        let shared = self.shared.read();
+        let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+        // A spilling writer must read its own frames before commit. Extend
+        // coverage only across a complete prefix; a fast-reopened process
+        // cannot fill a missing prefix merely by writing newer frames.
+        if (frame_id == 1 && snapshot.max_frame == 0) || coverage.covers(snapshot, frame_id - 1) {
+            coverage.record_snapshot(snapshot, frame_id);
+        }
     }
 
     fn rollback_cache(&self, max_frame: u64) {
         self.fallback.rollback_cache(max_frame);
         self.authority.rollback_frames(max_frame);
-        self.clear_overflow_fallback_coverage();
+        let shared = self.shared.read();
+        let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+        // Removing an uncommitted suffix does not invalidate the prefix.
+        let retained = coverage.max_frame.min(max_frame);
+        if retained == 0 {
+            coverage.clear();
+        } else {
+            coverage.max_frame = retained;
+        }
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -3296,7 +3349,9 @@ impl WalFile {
             .ensure_local_frame_cache_covers(&self.io, shared_snapshot)
         {
             return match err {
-                LimboError::Busy => TryBeginReadResult::Retry,
+                // Sleeping cannot fill a missing local frame cache. Let the
+                // statement's asynchronous busy handler control this wait.
+                LimboError::Busy => TryBeginReadResult::Busy,
                 other => TryBeginReadResult::Err(other),
             };
         }
@@ -3335,40 +3390,15 @@ impl WalFile {
 
 impl Wal for WalFile {
     fn begin_read_tx(&self) -> Result<bool> {
-        // Implement progressive backoff because transient lock contention
-        // should resolve quickly, but under heavy contention busy-spinning wastes
-        // CPU. SQLite uses quadratic backoff after 5 retries, with total delay
-        // up to ~10 seconds before giving up, so we just mirror SQLite's implementation
-        // here.
-        let mut cnt = 0u32;
-        loop {
-            tracing::trace!("begin_read_tx: cnt={cnt}");
+        for _ in 0..5 {
             match self.try_begin_read_tx() {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
                 TryBeginReadResult::Err(err) => return Err(err),
                 TryBeginReadResult::Busy => return Err(LimboError::Busy),
-                TryBeginReadResult::Retry => {
-                    cnt += 1;
-                    if cnt > 100 {
-                        return Err(LimboError::Busy);
-                    }
-                    // Progressive backoff: first 5 retries are immediate, then we
-                    // start yielding/sleeping with increasing delays.
-                    if cnt > 5 {
-                        if cnt < 10 {
-                            // Retries 6-9: yield to scheduler (minimal delay)
-                            self.io.yield_now();
-                        } else {
-                            // Retries 10+: quadratic backoff in microseconds
-                            // Formula matches SQLite: (cnt-9)^2 * 39 microseconds
-                            let delay_us = ((cnt - 9) * (cnt - 9) * 39) as u64;
-                            self.io.sleep(std::time::Duration::from_micros(delay_us));
-                        }
-                    }
-                    continue;
-                }
+                TryBeginReadResult::Retry => continue,
             }
         }
+        Err(LimboError::Busy)
     }
 
     fn mvcc_refresh_if_db_changed(&self) -> bool {
@@ -3527,9 +3557,9 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let frame = self
-            .coordination
-            .find_frame(page_id, min_frame, max_frame, frame_watermark);
+        let frame =
+            self.coordination
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark)?;
         if let Some(frame) = frame {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
@@ -3912,6 +3942,7 @@ impl Wal for WalFile {
             };
         }
 
+        self.coordination.reserve_frames(frame_id)?;
         // perform actual write
         let offset = self.frame_offset(frame_id);
         let header = self.coordination.wal_header();
@@ -4401,6 +4432,11 @@ impl Wal for WalFile {
             rolling_checksum = (header.checksum_1, header.checksum_2);
         }
 
+        self.coordination.reserve_frames(
+            next_frame_id
+                .checked_add(pages.len() as u64 - 1)
+                .ok_or(LimboError::IntegerOverflow)?,
+        )?;
         let first_frame_id = next_frame_id;
 
         let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
@@ -4507,6 +4543,12 @@ impl Wal for WalFile {
         let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
+        self.coordination.reserve_frames(
+            self.max_frame
+                .load(Ordering::Acquire)
+                .checked_add(pages.len() as u64)
+                .ok_or(LimboError::IntegerOverflow)?,
+        )?;
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         let mut rolling_checksum = if next_frame_id == 1 {
             (header.checksum_1, header.checksum_2)
@@ -4839,7 +4881,7 @@ impl WalFile {
                     );
                     let mut to_checkpoint = self
                         .coordination
-                        .iter_latest_frames(oc_min_frame, oc_max_frame);
+                        .try_iter_latest_frames(oc_min_frame, oc_max_frame)?;
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                     // Every frame we are about to backfill must be durable in
@@ -5637,9 +5679,7 @@ impl WalFileShared {
             return sqlite3_ondisk::build_shared_wal(&file, io);
         }
         if snapshot.max_frame > snapshot.nbackfills
-            && authority
-                .iter_latest_frames(0, snapshot.max_frame)
-                .is_empty()
+            && !authority.has_visible_frame(snapshot.max_frame)?
         {
             tracing::debug!(
                 max_frame = snapshot.max_frame,
@@ -8252,10 +8292,70 @@ pub mod test {
         );
 
         wal.end_read_tx();
+        assert!(matches!(wal.try_begin_read_tx(), TryBeginReadResult::Busy));
         assert!(
             matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
             "new readers must also refuse an uncovered overflowed frame index without blocking"
         );
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn reopened_writer_grows_past_64_blocks_without_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("reopened-overflow.db-wal");
+        let shm_path = dir.path().join("reopened-overflow.db-tshm");
+        let io = shared_wal_test_io();
+        let first = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        {
+            let authority =
+                MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap();
+            authority.install_snapshot(first);
+            authority.record_frame(7, 1);
+        }
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert!(shared.read().runtime.frame_cache.lock().is_empty());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let capacity = 4096 * 64;
+        // Model one writer's committed frame mappings after its fast reopen.
+        for frame in 2..=capacity {
+            coordination.cache_frame(9, frame);
+        }
+        coordination.publish_commit(WalCommitState {
+            max_frame: capacity,
+            last_checksum: (41, 43),
+            transaction_count: 2,
+        });
+        assert!(!authority.frame_index_overflowed());
+        coordination
+            .ensure_local_frame_cache_covers(&io, coordination.load_snapshot())
+            .unwrap();
+        assert_eq!(coordination.find_frame(7, 0, capacity, None), Some(1));
+        coordination.cache_frame(9, capacity + 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: capacity + 1,
+            last_checksum: (47, 53),
+            transaction_count: 3,
+        });
+        assert!(!authority.frame_index_overflowed());
+        coordination
+            .ensure_local_frame_cache_covers(&io, coordination.load_snapshot())
+            .unwrap();
+        assert_eq!(coordination.find_frame(7, 0, capacity + 1, None), Some(1));
+        assert!(!shared.read().runtime.frame_cache.lock().contains_key(&7));
     }
 
     #[cfg(host_shared_wal)]
@@ -8292,6 +8392,84 @@ pub mod test {
             .ensure_local_frame_cache_covers(&io, snapshot)
             .expect("same-process commits must keep the overflow fallback complete");
         assert_eq!(coordination.find_frame(11, 0, 3, None), Some(3));
+    }
+
+    // Regression: rolling back a suffix must retain complete prefix coverage.
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn rollback_preserves_complete_prefix_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("rollback-coverage.db-wal");
+        let shm_path = dir.path().join("rollback-coverage.db-tshm");
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+        coordination.cache_frame(7, 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 1,
+            last_checksum: (31, 37),
+            transaction_count: 1,
+        });
+        authority.mark_frame_index_overflowed_for_tests();
+        coordination
+            .ensure_local_frame_cache_covers(&io, coordination.load_snapshot())
+            .unwrap();
+        coordination.cache_frame(9, 2);
+        let mut writer_snapshot = coordination.load_snapshot();
+        writer_snapshot.max_frame = 2;
+        coordination
+            .ensure_local_frame_cache_covers(&io, writer_snapshot)
+            .unwrap();
+        coordination.rollback_cache(1);
+        assert!(coordination.overflow_fallback_covers(authority.snapshot(), 1));
+        assert!(!coordination.overflow_fallback_covers(authority.snapshot(), 2));
+        assert_eq!(coordination.find_frame(7, 0, 1, None), Some(1));
+        assert_eq!(coordination.find_frame(9, 0, 2, None), None);
+        coordination
+            .ensure_local_frame_cache_covers(&io, coordination.load_snapshot())
+            .unwrap();
+        println!("FIXED: rollback retains coverage of the complete committed frame cache");
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn cache_coverage_does_not_skip_peer_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let file = io
+            .open_file(
+                dir.path().join("peer-gap.db-wal").to_str().unwrap(),
+                crate::OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let (authority, coordination) =
+            make_test_shm_coordination(&shared, &dir.path().join("peer-gap.db-tshm"));
+        coordination.cache_frame(7, 1);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 1,
+            last_checksum: (31, 37),
+            transaction_count: 1,
+        });
+        // A peer commits frame 2 without populating this process's local cache.
+        authority.record_frame(9, 2);
+        authority.publish_commit(2, 41, 43, 2);
+        coordination.cache_frame(11, 3);
+        coordination.publish_commit(WalCommitState {
+            max_frame: 3,
+            last_checksum: (47, 53),
+            transaction_count: 3,
+        });
+        authority.mark_frame_index_overflowed_for_tests();
+        assert!(matches!(
+            coordination.ensure_local_frame_cache_covers(&io, coordination.load_snapshot()),
+            Err(LimboError::Busy)
+        ));
+        assert!(!shared.read().runtime.frame_cache.lock().contains_key(&9));
     }
 
     #[cfg(host_shared_wal)]

@@ -1,6 +1,40 @@
 use tokio::fs;
 use turso::{Builder, EncryptionOpts, Error, Value};
 
+#[tokio::test]
+async fn query_timeout_interrupts_contention_and_allows_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deadline.db");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let writer = db.connect().unwrap();
+    let contender = db.connect().unwrap();
+    writer
+        .execute("CREATE TABLE test(id INTEGER)", ())
+        .await
+        .unwrap();
+    writer.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    contender
+        .busy_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    contender
+        .query_timeout(std::time::Duration::from_millis(10))
+        .unwrap();
+    let error = contender.execute("BEGIN IMMEDIATE", ()).await.unwrap_err();
+    assert!(
+        error.to_string().to_lowercase().contains("interrupt"),
+        "{error}"
+    );
+    writer.execute("ROLLBACK", ()).await.unwrap();
+    contender.query_timeout(std::time::Duration::ZERO).unwrap();
+    contender
+        .execute("INSERT INTO test VALUES(1)", ())
+        .await
+        .unwrap();
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct DirectorySnapshot {
     modified: std::time::SystemTime,

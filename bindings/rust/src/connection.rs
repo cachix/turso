@@ -223,6 +223,13 @@ impl Connection {
         Ok(conn.get_auto_commit())
     }
 
+    /// Set a cooperative elapsed-time limit for each statement, including lock waits.
+    /// Zero disables the limit. Expiry interrupts execution and may roll back a transaction.
+    pub fn query_timeout(&self, duration: std::time::Duration) -> Result<()> {
+        self.get_inner_connection()?.set_query_timeout(duration);
+        Ok(())
+    }
+
     /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
     ///
     /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html

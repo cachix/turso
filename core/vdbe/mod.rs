@@ -2256,6 +2256,13 @@ impl Program {
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
+        if !state.halt_in_progress
+            && state
+                .query_deadline
+                .is_some_and(|deadline| pager.io.current_time_monotonic() >= deadline)
+        {
+            state.check_countdown = 1;
+        }
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
         let result = if enable_tracing || vdbe_trace {
